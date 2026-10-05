@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Carros que aprenden (PPO + TensorFlow.js)</title>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+body{margin:0;background:#12141a;color:#ebebeb;font:14px system-ui,sans-serif;text-align:center}
+canvas{max-width:100%;height:auto;touch-action:none;cursor:crosshair;background:#191c23}
+button{background:#2a2f3a;color:#ebebeb;border:1px solid #444;border-radius:6px;padding:8px 14px;margin:8px 4px;font-size:14px}
+p{margin:4px 12px;color:#aab}
+</style></head><body>
+<canvas id="c" width="1000" height="700"></canvas><br>
+<button id="fast">Modo rápido: off</button><button id="clr">Limpiar paredes</button>
+<p>Clic izquierdo (arrastrar) = pared · clic derecho = borrar. Los carros empiezan sin saber nada y aprenden de sus choques (puntos rojos).</p>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script>
+const W=1000,H=700,RH=36,N=64,NS=7,MAXD=180,STEP=6,VMIN=1.5,VMAX=6,STALL=80,MAXS=800;
+const T=128,EP=4,MB=1024,GAMMA=.99,LAM=.95,LR=3e-4,OD=NS+1;
+const SA=[-75,-45,-20,0,20,45,75].map(d=>d*Math.PI/180);
+const CTRL=[[150,600],[350,610],[520,570],[640,630],[800,610],[920,520],[930,380],[880,230],[760,140],[620,200],[560,330],[440,260],[360,130],[220,100],[110,190],[80,330],[110,480]];
+const rnd=(a,b)=>a+Math.random()*(b-a);
+// pista (Catmull-Rom)
+const Cx=[],Cy=[];
+for(let i=0;i<CTRL.length;i++){const n=CTRL.length,p0=CTRL[(i-1+n)%n],p1=CTRL[i],p2=CTRL[(i+1)%n],p3=CTRL[(i+2)%n];
+ for(let k=0;k<40;k++){const t=k/40,f=j=>.5*(2*p1[j]+(-p0[j]+p2[j])*t+(2*p0[j]-5*p1[j]+4*p2[j]-p3[j])*t*t+(-p0[j]+3*p1[j]-3*p2[j]+p3[j])*t*t*t);Cx.push(f(0));Cy.push(f(1));}}
+const M=Cx.length;
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+const mk=()=>{const c=document.createElement('canvas');c.width=W;c.height=H;return c};
+const trackC=mk(),tx=trackC.getContext('2d'),mC=mk(),mx=mC.getContext('2d'),wallC=mk(),wx=wallC.getContext('2d');
+tx.fillStyle='#191c23';tx.fillRect(0,0,W,H);mx.fillStyle='#000';mx.fillRect(0,0,W,H);
+const circ=(g,x,y,r,col)=>{g.fillStyle=col;g.beginPath();g.arc(x,y,r,0,7);g.fill()};
+for(let i=0;i<M;i++)circ(tx,Cx[i],Cy[i],RH+3,'#e6e6e6');
+for(let i=0;i<M;i++){circ(tx,Cx[i],Cy[i],RH,'#464850');circ(mx,Cx[i],Cy[i],RH,'#fff')}
+const md=mx.getImageData(0,0,W,H).data,base=new Uint8Array(W*H),road=new Uint8Array(W*H),wmask=new Uint8Array(W*H);
+for(let i=0;i<W*H;i++)base[i]=road[i]=md[i*4]>127?1:0;
+// paredes
+const R=14;
+function paint(x,y,add){
+ for(let dy=-R;dy<=R;dy++)for(let dx=-R;dx<=R;dx++){if(dx*dx+dy*dy>R*R)continue;const px=x+dx,py=y+dy;if(px<0||py<0||px>=W||py>=H)continue;const k=py*W+px;wmask[k]=add?1:0;road[k]=base[k]&&!wmask[k]?1:0}
+ wx.globalCompositeOperation=add?'source-over':'destination-out';circ(wx,x,y,R,'#ff8c00');wx.globalCompositeOperation='source-over'}
+function stroke(a,b,add){const n=Math.max(1,Math.floor(Math.max(Math.abs(b[0]-a[0]),Math.abs(b[1]-a[1]))/6));for(let k=0;k<=n;k++){const t=k/n;paint(Math.round(a[0]+(b[0]-a[0])*t),Math.round(a[1]+(b[1]-a[1])*t),add)}}
+let lastP=null,btn=0;
+const pos=e=>{const r=cv.getBoundingClientRect();return[Math.round((e.clientX-r.left)*W/r.width),Math.round((e.clientY-r.top)*H/r.height)]};
+cv.oncontextmenu=e=>e.preventDefault();
+cv.onpointerdown=e=>{btn=e.button===2?2:1;lastP=pos(e);paint(lastP[0],lastP[1],btn===1);cv.setPointerCapture(e.pointerId)};
+cv.onpointermove=e=>{if(!btn)return;const p=pos(e);stroke(lastP,p,btn===1);lastP=p};
+cv.onpointerup=()=>{btn=0};
+document.getElementById('clr').onclick=()=>{wmask.fill(0);road.set(base);wx.clearRect(0,0,W,H)};
+let fast=false;const fb=document.getElementById('fast');fb.onclick=()=>{fast=!fast;fb.textContent='Modo rápido: '+(fast?'ON':'off')};
+// entorno
+const X=new Float64Array(N),Y=new Float64Array(N),A=new Float64Array(N),S=new Float64Array(N),P=new Float64Array(N),B=new Float64Array(N);
+const I=new Int32Array(N),ST=new Int32Array(N),AG=new Int32Array(N),D=new Float32Array(N*NS);
+let laps=0,ema=0,crashes=[];
+function respawn(i){let k=Math.floor(Math.random()*M);for(let t=0;t<6&&!road[(Cy[k]|0)*W+(Cx[k]|0)];t++)k=Math.floor(Math.random()*M);
+ const k2=(k+1)%M,tg=Math.atan2(Cy[k2]-Cy[k],Cx[k2]-Cx[k]),o=rnd(-.4,.4)*RH;
+ X[i]=Cx[k]-Math.sin(tg)*o;Y[i]=Cy[k]+Math.cos(tg)*o;A[i]=tg+rnd(-.3,.3);S[i]=rnd(VMIN,4);I[i]=k;P[i]=B[i]=0;ST[i]=AG[i]=0}
+for(let i=0;i<N;i++)respawn(i);
+function obs(){const o=new Float32Array(N*OD);
+ for(let i=0;i<N;i++){for(let s=0;s<NS;s++){const a=A[i]+SA[s],c=Math.cos(a),n=Math.sin(a);let d=MAXD;
+  for(let r=STEP;r<=MAXD;r+=STEP){const px=Math.min(W-1,Math.max(0,(X[i]+c*r)|0)),py=Math.min(H-1,Math.max(0,(Y[i]+n*r)|0));if(!road[py*W+px]){d=r;break}}
+  D[i*NS+s]=d;o[i*OD+s]=d/MAXD}o[i*OD+NS]=S[i]/VMAX}return o}
+function step(act){const rew=new Float32Array(N),done=new Float32Array(N);
+ for(let i=0;i<N;i++){const a=act[i];A[i]+=(Math.floor(a/3)-1)*.08;S[i]=Math.min(VMAX,Math.max(VMIN,S[i]+(a%3-1)*.2));
+  X[i]+=Math.cos(A[i])*S[i];Y[i]+=Math.sin(A[i])*S[i];
+  const ix=Math.min(W-1,Math.max(0,X[i]|0)),iy=Math.min(H-1,Math.max(0,Y[i]|0)),crashed=!road[iy*W+ix];
+  let bk=0,bd=1e18;for(let o=-10;o<=30;o++){const c=(I[i]+o+M)%M,d2=(Cx[c]-X[i])**2+(Cy[c]-Y[i])**2;if(d2<bd){bd=d2;bk=o}}
+  I[i]=(I[i]+bk+M)%M;P[i]+=bk;let r=.1*bk;
+  if(P[i]>B[i]+1){B[i]=P[i];ST[i]=0}else ST[i]++;
+  AG[i]++;const stalled=ST[i]>STALL,lap=P[i]>=M;
+  if(stalled)r-=1;if(lap)r+=2;if(crashed)r=-3;
+  if(crashed||stalled||lap||AG[i]>=MAXS){done[i]=1;if(lap)laps++;ema=.97*ema+.03*(P[i]/M);
+   if(crashed){crashes.push([X[i],Y[i]]);if(crashes.length>150)crashes.shift()}respawn(i)}
+  rew[i]=r}
+ return[obs(),rew,done]}
+// red
+const inp=tf.input({shape:[OD]});
+const h=tf.layers.dense({units:64,activation:'tanh'}).apply(tf.layers.dense({units:64,activation:'tanh'}).apply(inp));
+const net=tf.model({inputs:inp,outputs:[tf.layers.dense({units:9}).apply(h),tf.layers.dense({units:1}).apply(h)]});
+const opt=tf.train.adam(LR);
+function infer(o){const t=tf.tidy(()=>{const[l,v]=net.predict(tf.tensor2d(o,[N,OD]));return tf.concat([l,v],1)});const d=t.dataSync();t.dispose();return d}
+function update(buf,lastObs){
+ const lv=infer(lastObs),adv=new Float32Array(T*N),ret=new Float32Array(T*N);
+ for(let i=0;i<N;i++){let last=0;for(let t=T-1;t>=0;t--){const nv=t===T-1?lv[i*10+9]:buf.val[t+1][i],nd=1-buf.done[t][i],v=buf.val[t][i],
+  dl=buf.rew[t][i]+GAMMA*nv*nd-v;last=dl+GAMMA*LAM*nd*last;adv[t*N+i]=last;ret[t*N+i]=last+v}}
+ let m=0;for(const a of adv)m+=a;m/=adv.length;let sd=0;for(const a of adv)sd+=(a-m)**2;sd=Math.sqrt(sd/adv.length)+1e-8;for(let k=0;k<adv.length;k++)adv[k]=(adv[k]-m)/sd;
+ const n=T*N,fo=new Float32Array(n*OD),fa=new Int32Array(n),fl=new Float32Array(n);
+ for(let t=0;t<T;t++){fo.set(buf.obs[t],t*N*OD);fa.set(buf.act[t],t*N);fl.set(buf.logp[t],t*N)}
+ const tO=tf.tensor2d(fo,[n,OD]),tA=tf.tensor1d(fa,'int32'),tL=tf.tensor1d(fl),tAd=tf.tensor1d(adv),tR=tf.tensor1d(ret);
+ for(let e=0;e<EP;e++){const perm=[...Array(n).keys()].sort(()=>Math.random()-.5);
+  for(let s=0;s<n;s+=MB){tf.tidy(()=>{const ix=tf.tensor1d(perm.slice(s,s+MB),'int32'),o=tO.gather(ix),a=tA.gather(ix),lo=tL.gather(ix),ad=tAd.gather(ix),re=tR.gather(ix);
+   opt.minimize(()=>{const[lg,v]=net.predict(o),lp=tf.logSoftmax(lg),ln=lp.mul(tf.oneHot(a,9)).sum(1),ra=ln.sub(lo).exp();
+    const pl=tf.minimum(ra.mul(ad),ra.clipByValue(.8,1.2).mul(ad)).mean().neg(),vl=v.reshape([-1]).sub(re).square().mean(),en=lp.exp().mul(lp).sum(1).neg().mean();
+    return pl.add(vl.mul(.5)).sub(en.mul(.01))})})}}
+ tf.dispose([tO,tA,tL,tAd,tR])}
+// bucle
+let cur=obs(),buf={obs:[],act:[],logp:[],val:[],rew:[],done:[]},updates=0;
+function once(){const o=infer(cur),act=new Int32Array(N),lp=new Float32Array(N),val=new Float32Array(N);
+ for(let i=0;i<N;i++){const l=o.subarray(i*10,i*10+9);let mx_=-1e9;for(const v of l)mx_=Math.max(mx_,v);let z=0;const p=Array.from(l,v=>{const e=Math.exp(v-mx_);z+=e;return e});
+  let u=Math.random()*z,a=0;while(a<8&&u>p[a]){u-=p[a];a++}act[i]=a;lp[i]=Math.log(p[a]/z);val[i]=o[i*10+9]}
+ const[no,rew,done]=step(act);
+ buf.obs.push(cur);buf.act.push(act);buf.logp.push(lp);buf.val.push(val);buf.rew.push(rew);buf.done.push(done);cur=no;
+ if(buf.obs.length===T){update(buf,cur);buf={obs:[],act:[],logp:[],val:[],rew:[],done:[]};updates++}}
+function draw(){ctx.drawImage(trackC,0,0);ctx.drawImage(wallC,0,0);
+ for(const[x,y]of crashes)circ(ctx,x,y,3,'#dc3c3c');
+ let lead=0;for(let i=1;i<N;i++)if(P[i]>P[lead])lead=i;
+ ctx.strokeStyle='#fff';ctx.lineWidth=2;
+ for(let i=0;i<N;i++){if(i===lead)continue;circ(ctx,X[i],Y[i],5,'#50c8ff');ctx.beginPath();ctx.moveTo(X[i],Y[i]);ctx.lineTo(X[i]+Math.cos(A[i])*9,Y[i]+Math.sin(A[i])*9);ctx.stroke()}
+ ctx.strokeStyle='#ff5a5a';ctx.lineWidth=1;
+ for(let s=0;s<NS;s++){const a=A[lead]+SA[s],d=D[lead*NS+s];ctx.beginPath();ctx.moveTo(X[lead],Y[lead]);ctx.lineTo(X[lead]+Math.cos(a)*d,Y[lead]+Math.sin(a)*d);ctx.stroke()}
+ circ(ctx,X[lead],Y[lead],7,'#ffdc3c');
+ ctx.fillStyle='#ebebeb';ctx.font='18px monospace';
+ [`Actualizaciones: ${updates}   Pasos: ${(updates*T*N).toLocaleString()}`,`Avance medio por intento: ${Math.round(ema*100)}%  (si sube, aprende)`,`Vueltas completadas: ${laps}`].forEach((t,k)=>ctx.fillText(t,12,26+22*k))}
+tf.ready().then(()=>{(function loop(){for(let k=0;k<(fast?8:1);k++)once();draw();requestAnimationFrame(loop)})()});
+</script></body></html>
